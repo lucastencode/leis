@@ -1,0 +1,132 @@
+# Sincroniza este fork com o repositório original (ctresb/leis), uma vez por semana.
+#
+# Proteções antes de sincronizar:
+#   1. Histórico reescrito: se o original apagou/reescreveu commits que este fork já tem,
+#      a sincronização para (o fork guarda a versão antiga intacta).
+#   2. Exclusão em massa: se o original remover mais arquivos do que LIMITE_EXCLUSOES
+#      (sem ser só mudança de pasta), a sincronização para e pede conferência.
+# Se parar, o GitHub manda e-mail de falha. Para sincronizar mesmo assim, rode manualmente
+# (aba Actions > "Sincronizar com o original" > Run workflow) marcando "ignorar_exclusoes".
+#
+# A sincronização em si é feita no próprio GitHub (API merge-upstream): nada é baixado
+# além do índice de arquivos das duas versões, só para a conferência.
+
+name: Sincronizar com o original
+
+on:
+  schedule:
+    - cron: "17 9 * * 1" # segundas, 06h17 (horário de Brasília)
+  workflow_dispatch:
+    inputs:
+      ignorar_exclusoes:
+        description: "Sincronizar mesmo com exclusões acima do limite"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sincronizar-original
+  cancel-in-progress: false
+
+jobs:
+  sincronizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ORIGINAL: ctresb/leis
+      RAMO: main
+      ARQUIVO_PROPRIO: .github/workflows/sincronizar-original.yml
+      LIMITE_EXCLUSOES: "200"
+      LIMITE_COMMITS_PROPRIOS: "20"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Comparar com o original
+        id: comparar
+        run: |
+          set -euo pipefail
+          DONO_ORIGINAL="${ORIGINAL%%/*}"
+          DONO_FORK="${GITHUB_REPOSITORY%%/*}"
+          gh api "repos/${GITHUB_REPOSITORY}/compare/${DONO_ORIGINAL}:${RAMO}...${DONO_FORK}:${RAMO}" > comparacao.json
+          STATUS=$(jq -r .status comparacao.json)
+          ATRAS=$(jq -r .behind_by comparacao.json)
+          echo "Situação: ${STATUS} | commits novos no original: ${ATRAS}"
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo "atras=${ATRAS}" >> "$GITHUB_OUTPUT"
+
+      - name: "Conferência 1: histórico do original não foi reescrito"
+        if: steps.comparar.outputs.atras != '0'
+        run: |
+          set -euo pipefail
+          # Commits que existem aqui e não no original. Só podem ser merges da própria
+          # sincronização ou commits que mexem apenas neste arquivo de automação.
+          PROPRIOS=$(jq -r '.commits[] | select((.parents | length) < 2) | .sha' comparacao.json)
+          QTD=$(printf '%s' "$PROPRIOS" | grep -c . || true)
+          AFRENTE=$(jq -r .ahead_by comparacao.json)
+          if [ "$AFRENTE" -gt 250 ] || [ "$QTD" -gt "$LIMITE_COMMITS_PROPRIOS" ]; then
+            echo "::error::O fork tem ${AFRENTE} commits que o original não tem. O original provavelmente reescreveu o histórico. Sincronização suspensa; o fork continua com a versão anterior."
+            exit 1
+          fi
+          for SHA in $PROPRIOS; do
+            FORA=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}" --jq '.files[].filename' | grep -vxF "$ARQUIVO_PROPRIO" || true)
+            if [ -n "$FORA" ]; then
+              echo "::error::O commit ${SHA} existe no fork mas sumiu do original (mexe em: $(echo "$FORA" | head -3 | tr '\n' ' ')). Sincronização suspensa."
+              exit 1
+            fi
+          done
+          echo "OK: o histórico do original só cresceu."
+
+      - name: "Conferência 2: exclusões em massa"
+        if: steps.comparar.outputs.atras != '0'
+        run: |
+          set -euo pipefail
+          git init -q indice && cd indice
+          git remote add fork "https://github.com/${GITHUB_REPOSITORY}"
+          git remote add original "https://github.com/${ORIGINAL}"
+          # Só a lista de arquivos (sem conteúdo) da versão atual de cada lado.
+          git fetch -q --no-tags --filter=blob:none --depth=1 fork "${RAMO}:refs/fork"
+          git fetch -q --no-tags --filter=blob:none --depth=1 original "${RAMO}:refs/original"
+          git -c core.quotepath=off diff --raw --no-abbrev --no-renames -r --diff-filter=AD refs/fork refs/original > ../diferencas.txt
+          cd ..
+          python3 - <<'PY'
+          import os, sys
+          proprio = os.environ["ARQUIVO_PROPRIO"]
+          limite = int(os.environ["LIMITE_EXCLUSOES"])
+          apagados, novos = {}, set()
+          for linha in open("diferencas.txt", encoding="utf-8", errors="replace"):
+              meta, caminho = linha.rstrip("\n").split("\t", 1)
+              _, _, oid_antigo, oid_novo, tipo = meta.split()
+              if tipo == "D":
+                  apagados[caminho] = oid_antigo
+              else:
+                  novos.add(oid_novo)
+          apagados.pop(proprio, None)
+          # Arquivo que só mudou de pasta (mesmo conteúdo) não conta como exclusão.
+          perdidos = sorted(c for c, oid in apagados.items() if oid not in novos)
+          print(f"Arquivos removidos no original: {len(apagados)} | sem cópia em outra pasta: {len(perdidos)}")
+          for c in perdidos[:30]:
+              print("  -", c)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as r:
+              r.write(f"### Exclusões no original\n\n{len(perdidos)} arquivo(s) removido(s) sem cópia em outra pasta (limite: {limite}).\n\n")
+              for c in perdidos[:100]:
+                  r.write(f"- `{c}`\n")
+          if len(perdidos) > limite and os.environ.get("IGNORAR") != "true":
+              print(f"::error::O original removeu {len(perdidos)} arquivos (limite {limite}). Sincronização suspensa para conferência. Para sincronizar mesmo assim, rode manualmente marcando 'ignorar_exclusoes'.")
+              sys.exit(1)
+          PY
+        env:
+          IGNORAR: ${{ inputs.ignorar_exclusoes }}
+
+      - name: Sincronizar (no próprio GitHub)
+        if: steps.comparar.outputs.atras != '0'
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch="${RAMO}" > resultado.json
+          cat resultado.json
+          echo "### Sincronizado" >> "$GITHUB_STEP_SUMMARY"
+          echo "$(jq -r .message resultado.json) (${{ steps.comparar.outputs.atras }} commit(s) novos)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Nada novo
+        if: steps.comparar.outputs.atras == '0'
+        run: echo "O fork já está igual ao original." | tee -a "$GITHUB_STEP_SUMMARY"
